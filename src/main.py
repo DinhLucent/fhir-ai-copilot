@@ -165,6 +165,9 @@ class ValidationReport:
             "issues": [i.to_dict() for i in self.issues],
         }
 
+    def __repr__(self) -> str:
+        return f"ValidationReport({self.resource_type}/{self.resource_id}, errors={len(self.errors)})"
+
 
 class FHIRValidator:
     """Validate FHIR R4 resource dictionaries (JSON-parsed)."""
@@ -263,6 +266,36 @@ class FHIRValidator:
         self._validate_resource_specific(resource_type, resource, issues)
 
         return report
+
+    def bundle_doctor(self, bundle: Dict[str, Any]) -> List[FHIRIssue]:
+        """Check reference integrity within a Bundle."""
+        issues = []
+        if bundle.get("resourceType") != "Bundle":
+            return issues
+
+        entries = bundle.get("entry", [])
+        known_ids = set()
+        for entry in entries:
+            res = entry.get("resource", {})
+            rtype = res.get("resourceType")
+            rid = res.get("id")
+            if rtype and rid:
+                known_ids.add(f"{rtype}/{rid}")
+
+        for i, entry in enumerate(entries):
+            res = entry.get("resource", {})
+            # Check subject/patient references
+            sub = res.get("subject", {}).get("reference")
+            if sub and not sub.startswith(("http", "urn:")):
+                if sub not in known_ids:
+                    issues.append(FHIRIssue(
+                        path=f"entry[{i}].resource.subject.reference",
+                        severity=Severity.WARNING,
+                        code="DANGLING_REFERENCE",
+                        message=f"Reference '{sub}' not found in bundle",
+                        suggestion="Ensure all referenced resources are included in the Bundle",
+                    ))
+        return issues
 
     def _validate_resource_specific(
         self,
@@ -591,12 +624,15 @@ FHIR_QUERY_PATTERNS = [
     (r"patient.*name.*(\w+)", "GET /Patient?name={0}"),
     (r"patient.*id.*(\w+)",   "GET /Patient/{0}"),
     (r"observations?.*patient.*(\w+)", "GET /Observation?patient={0}"),
+    (r"status.*(\w+).*patient.*(\w+)", "GET /{0}?patient={1}&status=active"),
+    (r"active.*(\w+).*patient.*(\w+)", "GET /{0}?patient={1}&status=active"),
     (r"encounter.*patient.*(\w+)", "GET /Encounter?patient={0}"),
     (r"condition.*patient.*(\w+)", "GET /Condition?patient={0}"),
     (r"medic.*patient.*(\w+)", "GET /MedicationRequest?patient={0}"),
     (r"all resources.*patient.*(\w+)", "GET /Patient/{0}/$everything"),
     (r"bundle.*patient.*(\w+)", "GET /Patient/{0}/$everything"),
     (r"latest obs.*(\w+)", "GET /Observation?patient={0}&_sort=-date&_count=1"),
+    (r"(\w+).*since.*(\d{4}-\d{2}-\d{2})", "GET /{0}?_lastUpdated=gt{1}"),
 ]
 
 
@@ -637,6 +673,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     v = sub.add_parser("validate", help="Validate a FHIR JSON resource file")
     v.add_argument("file", help="Path to FHIR JSON resource")
     v.add_argument("--json", action="store_true", dest="json_out")
+    v.add_argument("--doctor", action="store_true", help="Run bundle reference integrity checks")
     v.add_argument("--exit-code", action="store_true")
 
     # template
@@ -670,6 +707,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"❌ {e}", file=sys.stderr)
             return 1
         report = FHIRValidator().validate(resource)
+        
+        if args.doctor and resource.get("resourceType") == "Bundle":
+            extra_issues = FHIRValidator().bundle_doctor(resource)
+            report.issues.extend(extra_issues)
+
         if args.json_out:
             print(json.dumps(report.to_dict(), indent=2))
         else:
